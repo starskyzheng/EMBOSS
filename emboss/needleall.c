@@ -24,6 +24,8 @@
 #include "emboss.h"
 #include <limits.h>
 #include <math.h>
+#include <omp.h>
+#include <string.h>
 
 
 
@@ -34,8 +36,43 @@
 **
 ******************************************************************************/
 
+// 存储序列信息的结构体
+typedef struct {
+    char* seq;
+    char* name;
+    ajuint len;
+} SeqInfo;
+
+// 处理命令行参数中的threads参数
+void process_threads_arg(int* argc, char*** argv) {
+    int i, j;
+    int new_argc = *argc;
+    char** new_argv = *argv;
+    
+    for(i = 1; i < *argc - 1; i++) {
+        if(strcmp(new_argv[i], "-threads") == 0) {
+            int num_threads = atoi(new_argv[i + 1]);
+            if(num_threads > 0) {
+                omp_set_num_threads(num_threads);
+            }
+            
+            // 从参数列表中移除-threads及其值
+            for(j = i; j < new_argc - 2; j++) {
+                new_argv[j] = new_argv[j + 2];
+            }
+            new_argc -= 2;
+            break;
+        }
+    }
+    
+    *argc = new_argc;
+}
+
 int main(int argc, char **argv)
 {
+    // 在embInit之前处理-threads参数
+    process_threads_arg(&argc, &argv);
+
     AjPAlign align;
     AjPSeqall seqall;
     AjPSeqset seqset;
@@ -43,12 +80,13 @@ int main(int argc, char **argv)
     AjPSeq seqb;
     AjPStr alga;
     AjPStr algb;
-    AjPStr ss;
+    //AjPStr ss;
     AjPFile errorf;
 
     ajuint lena;
     ajuint lenb;
     ajuint k;
+    ajuint i, j;
 
     const char *p;
     const char *q;
@@ -70,13 +108,13 @@ int main(int argc, char **argv)
     float endgapopen;
     float endgapextend;
     float minscore;
-    size_t maxarr = 1000;  /* arbitrary. realloc'd if needed */
+    size_t maxarr = 1000;
     size_t len;
 
     float score;
 
     AjBool dobrief = ajTrue;
-    AjBool endweight = ajFalse; /*whether end gap penalties should be applied*/
+    AjBool endweight = ajFalse;
 
     float id   = 0.;
     float sim  = 0.;
@@ -84,6 +122,9 @@ int main(int argc, char **argv)
     float simx = 0.;
 
     AjPStr tmpstr = NULL;
+
+    omp_lock_t writelock;
+    omp_init_lock(&writelock);
 
     embInit("needleall", argc, argv);
 
@@ -104,109 +145,175 @@ int main(int argc, char **argv)
     gapopen = ajRoundFloat(gapopen, 8);
     gapextend = ajRoundFloat(gapextend, 8);
 
-    AJCNEW0(compass, maxarr);
-    AJCNEW0(m, maxarr);
-    AJCNEW0(ix, maxarr);
-    AJCNEW0(iy, maxarr);
-
-    alga  = ajStrNew();
-    algb  = ajStrNew();
-    ss = ajStrNew();
-
     sub = ajMatrixfGetMatrix(matrix);
     cvt = ajMatrixfGetCvt(matrix);
+
+    // 收集所有序列信息
+    ajuint seqset_size = ajSeqsetGetSize(seqset);
+    SeqInfo* seqset_info = (SeqInfo*)malloc(seqset_size * sizeof(SeqInfo));
+    size_t max_seq_len = 0;
+
+    for(i = 0; i < seqset_size; i++) {
+        seqa = ajSeqsetGetseqSeq(seqset, i);
+        size_t curr_len = ajSeqGetLen(seqa);
+        if(curr_len > max_seq_len) max_seq_len = curr_len;
+        
+        seqset_info[i].len = curr_len;
+        seqset_info[i].seq = strdup(ajSeqGetSeqC(seqa));
+        seqset_info[i].name = strdup(ajSeqGetNameC(seqa));
+    }
+
+    // 计算所需的最大数组大小
+    maxarr = max_seq_len * max_seq_len;
+    if(maxarr < 1000) maxarr = 1000;
 
     while(ajSeqallNext(seqall,&seqb))
     {
         ajSeqTrim(seqb);
         lenb = ajSeqGetLen(seqb);
-
-        for(k=0;k<ajSeqsetGetSize(seqset);k++)
+        const char* seqb_seq = ajSeqGetSeqC(seqb);
+        const char* seqb_name = ajSeqGetNameC(seqb);
+        
+        #pragma omp parallel private(compass,m,ix,iy,alga,algb,tmpstr,score,id,sim,idx,simx,start1,start2)
         {
-            seqa = ajSeqsetGetseqSeq(seqset, k);
-            lena = ajSeqGetLen(seqa);
-
-
-            if(lenb > (LONG_MAX/(size_t)(lena+1)))
-                ajDie("Sequences too big.");
-
-            len = (size_t)lena*(size_t)lenb;
-
-            if(len>maxarr)
-            {
-                AJCRESIZETRY0(compass,(size_t)maxarr,len);
-                if(!compass)
-                    ajDie("Sequences too big, memory allocation failed");
-                AJCRESIZETRY0(m,(size_t)maxarr,len);
-                if(!m)
-                    ajDie("Sequences too big, memory allocation failed");
-                AJCRESIZETRY0(ix,(size_t)maxarr,len);
-                if(!ix)
-                    ajDie("Sequences too big, memory allocation failed");
-                AJCRESIZETRY0(iy,(size_t)maxarr,len);
-                if(!iy)
-                    ajDie("Sequences too big, memory allocation failed");
-                maxarr=len;
+            compass = NULL;
+            m = NULL;
+            ix = NULL;
+            iy = NULL;
+            alga = NULL;
+            algb = NULL;
+            tmpstr = NULL;
+            
+            AJCNEW0(compass, maxarr);
+            AJCNEW0(m, maxarr);
+            AJCNEW0(ix, maxarr);
+            AJCNEW0(iy, maxarr);
+            
+            if(!compass || !m || !ix || !iy) {
+                #pragma omp critical
+                {
+                    ajDie("Memory allocation failed in thread");
+                }
+            }
+            
+            alga = ajStrNewC("");
+            algb = ajStrNewC("");
+            tmpstr = ajStrNewC("");
+            
+            if(!alga || !algb || !tmpstr) {
+                if(compass) AJFREE(compass);
+                if(m) AJFREE(m);
+                if(ix) AJFREE(ix);
+                if(iy) AJFREE(iy);
+                if(alga) ajStrDel(&alga);
+                if(algb) ajStrDel(&algb);
+                if(tmpstr) ajStrDel(&tmpstr);
+                #pragma omp critical
+                {
+                    ajDie("String allocation failed in thread");
+                }
             }
 
+            #pragma omp for schedule(dynamic)
+            for(i = 0; i < seqset_size; i++)
+            {
+                if(lenb > (LONG_MAX/(size_t)(seqset_info[i].len+1)))
+                    continue;
 
-            p = ajSeqGetSeqC(seqa);
-            q = ajSeqGetSeqC(seqb);
+                ajStrAssignC(&alga,"");
+                ajStrAssignC(&algb,"");
 
-            ajStrAssignC(&alga,"");
-            ajStrAssignC(&algb,"");
-
-            score = embAlignPathCalcWithEndGapPenalties(p, q, lena, lenb,
+                score = embAlignPathCalcWithEndGapPenalties(
+                    seqset_info[i].seq, seqb_seq,
+                    seqset_info[i].len, lenb,
                     gapopen, gapextend, endgapopen, endgapextend,
                     &start1, &start2, sub, cvt, m, ix, iy,
                     compass, ajFalse, endweight);
 
-            embAlignWalkNWMatrixUsingCompass(p, q, &alga, &algb,
-                    lena, lenb, &start1, &start2, compass);
+                if(score > minscore) {
+                    embAlignWalkNWMatrixUsingCompass(
+                        seqset_info[i].seq, seqb_seq,
+                        &alga, &algb,
+                        seqset_info[i].len, lenb,
+                        &start1, &start2, compass);
 
-            if (score > minscore){
-                if(!ajAlignFormatShowsSequences(align))
-                {
-                    ajAlignDefineCC(align, ajStrGetPtr(alga),
-                            ajStrGetPtr(algb), ajSeqGetNameC(seqa),
-                            ajSeqGetNameC(seqb));
-                    ajAlignSetScoreR(align, score);
-                }
-                else
-                {
-                    embAlignReportGlobal(align, seqa, seqb, alga, algb,
-                            start1, start2,
-                            gapopen, gapextend,
-                            score, matrix,
-                            ajSeqGetOffset(seqa), ajSeqGetOffset(seqb));
-                }
+                    omp_set_lock(&writelock);
+                    
+                    if(!ajAlignFormatShowsSequences(align))
+                    {
+                        ajAlignDefineCC(align, ajStrGetPtr(alga),
+                                ajStrGetPtr(algb),
+                                seqset_info[i].name,
+                                seqb_name);
+                        ajAlignSetScoreR(align, score);
+                    }
+                    else
+                    {
+                        const AjPSeq curr_seqa = ajSeqsetGetseqSeq(seqset, i);
+                        embAlignReportGlobal(align, curr_seqa, seqb,
+                                alga, algb,
+                                start1, start2,
+                                gapopen, gapextend,
+                                score, matrix,
+                                0, 0);
+                    }
 
-                if(!dobrief)
-                {
-                    embAlignCalcSimilarity(alga,algb,sub,cvt,lena,lenb,&id,
-                            &sim, &idx, &simx);
-                    ajFmtPrintS(&tmpstr,"Longest_Identity = %5.2f%%\n",
-                            id);
-                    ajFmtPrintAppS(&tmpstr,"Longest_Similarity = %5.2f%%\n",
-                            sim);
-                    ajFmtPrintAppS(&tmpstr,"Shortest_Identity = %5.2f%%\n",
-                            idx);
-                    ajFmtPrintAppS(&tmpstr,"Shortest_Similarity = %5.2f%%",
-                            simx);
-                    ajAlignSetSubHeaderApp(align, tmpstr);
+                    if(!dobrief)
+                    {
+                        embAlignCalcSimilarity(alga, algb,
+                                sub, cvt, seqset_info[i].len, lenb,
+                                &id, &sim, &idx, &simx);
+                        ajStrAssignC(&tmpstr, "");
+                        ajFmtPrintS(&tmpstr,
+                                "Longest_Identity = %5.2f%%\n",
+                                id);
+                        ajFmtPrintAppS(&tmpstr,
+                                "Longest_Similarity = %5.2f%%\n",
+                                sim);
+                        ajFmtPrintAppS(&tmpstr,
+                                "Shortest_Identity = %5.2f%%\n",
+                                idx);
+                        ajFmtPrintAppS(&tmpstr,
+                                "Shortest_Similarity = %5.2f%%",
+                                simx);
+                        ajAlignSetSubHeaderApp(align, tmpstr);
+                    }
+                    
+                    ajAlignWrite(align);
+                    ajAlignReset(align);
+                    
+                    omp_unset_lock(&writelock);
                 }
-                ajAlignWrite(align);
-                ajAlignReset(align);
+                else {
+                    omp_set_lock(&writelock);
+                    ajFmtPrintF(errorf,
+                            "Alignment score (%.1f) is less than minimum score"
+                            "(%.1f) for sequences %s vs %s\n",
+                            score, minscore,
+                            seqset_info[i].name,
+                            seqb_name);
+                    omp_unset_lock(&writelock);
+                }
             }
-            else
-                ajFmtPrintF(errorf,
-                        "Alignment score (%.1f) is less than minimum score"
-                        "(%.1f) for sequences %s vs %s\n",
-                        score, minscore, ajSeqGetNameC(seqa),
-                        ajSeqGetNameC(seqb));
+            
+            if(compass) AJFREE(compass);
+            if(m) AJFREE(m);
+            if(ix) AJFREE(ix);
+            if(iy) AJFREE(iy);
+            if(alga) ajStrDel(&alga);
+            if(algb) ajStrDel(&algb);
+            if(tmpstr) ajStrDel(&tmpstr);
         }
     }
-    
+
+    // 清理序列信息
+    for(i = 0; i < seqset_size; i++) {
+        free(seqset_info[i].seq);
+        free(seqset_info[i].name);
+    }
+    free(seqset_info);
+
+    omp_destroy_lock(&writelock);
 
     if(!ajAlignFormatShowsSequences(align))
     {
@@ -217,22 +324,14 @@ int main(int argc, char **argv)
     ajAlignDel(&align);
     ajFileClose(&errorf);
 
-
     ajSeqallDel(&seqall);
     ajSeqsetDel(&seqset);
     ajSeqDel(&seqb);
-
-    AJFREE(compass);
-    AJFREE(ix);
-    AJFREE(iy);
-    AJFREE(m);
     
-    ajStrDel(&alga);
-    ajStrDel(&algb);
-    ajStrDel(&ss);
-    ajStrDel(&tmpstr);
+    //ajStrDel(&ss);
 
     embExit();
 
     return 0;
 }
+
