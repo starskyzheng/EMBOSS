@@ -2,6 +2,12 @@ THIS REPO IS A MIRROR OF THE EMBOSS SOURCE CODE
 ===============================================
 
 
+安装：
+./configure --prefix=/XXDIR/EMBOSS/EMBOSS-6.6.0_built CFLAGS="-fopenmp -O2" LDFLAGS="-fopenmp" CXXFLAGS="-O2"
+make ARFLAGS="cr" -j40
+make install # 可能需要遇到网络报错(Check for more recent updates to EMBOSS)，不影响安装进程
+
+
 General Users.
 -------------
 
@@ -151,3 +157,7 @@ and then type
    automake -a
 
 and then retry the make.
+
+
+
+
