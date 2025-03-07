@@ -1,6 +1,8 @@
 THIS REPO IS A MIRROR OF THE EMBOSS SOURCE CODE
 ===============================================
 
+修改说明：
+needleall允许并行计算： needleall -outfile XX -asequence IN1.fa -bsequence IN1.fa -gapextend 0.5 -gapopen 10 -datafile EBLOSUM62 -minscore -10 -nobrief -aformat pair -threads 64
 
 安装：
 ./configure --prefix=/XXDIR/EMBOSS/EMBOSS-6.6.0_built CFLAGS="-fopenmp -O2" LDFLAGS="-fopenmp" CXXFLAGS="-O2"
